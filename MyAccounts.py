@@ -1,102 +1,95 @@
-from smb.SMBConnection import SMBConnection
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-import os
-import pickle
+import pandas as pd
+import numpy as np
+from PyQt5.QtWidgets import QWidget, QTreeWidget, QTreeWidgetItem, QTableWidget, QTableWidgetItem, QVBoxLayout, \
+    QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox, QMessageBox, QApplication, QHeaderView
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 import re
-import tempfile
+import sys
+import os
+import requests
+import json
+import time
+
+PATH = sys.argv[0][:sys.argv[0].rfind(os.sep)+1] if os.sep in sys.argv[0] else ''
+FileName = 'my_logs.csv'
+if FileName not in os.listdir():
+    pd.DataFrame([], columns='日期,发起账户,类型,金额,目标账户,附言,账户类型'.split(',')).to_csv(PATH + FileName, index=False)
+TOPLEVEL = '所有账户'
+SUBLEVEL = ['我有的', '要还的', '欠我的']
+log_types = ['收入', '支出', '调整', '转出', '贷款', '还款', '借出']
+oppo_log_types = {'转出': '转入', '贷款': '借入', '还款': '消贷', '借出': '待收'}
+BitCoinAccountName = '比特币'
 
 
-class Balance(list):
-    def __init__(self, bal_name, bal_type):
-        super().__init__()
-        self.name = bal_name
-        self.bal_type = bal_type
-        self.balance = 0
+class Bitcoin(QThread):
+    price_sender = pyqtSignal(float)
+    price = 0
 
-    def record(self, date, _type, _amount, _other=None, _descrip=None, ):
-        self.balance += _amount
-        self.append((self.name, date, _type, _amount, _other, _descrip))
-
-
-class Account(dict):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.acc_name = '我的账户'
-
-    def set_name(self, acc_name):
-        self.acc_name = acc_name
-
-    def add_balcance(self, bal_name, bal_type):
-        self[bal_name] = Balance(bal_name, bal_type)
-
-    def operate(self, date, bal_name, _type, _amount, _other_name=None, _descrip=None):
-        if bal_name in self.keys():
-            self[bal_name].record(date, _type, _amount, _other_name, _descrip)
-            if _other_name:
-                self[_other_name].record(date, _type, -_amount, bal_name, _descrip)
-        else:
-            return False
-
-    def remove_record(self, log):
-        log[3] = float(log[3])
-        if log[0] in self.keys():
-            self[log[0]].balance -= log[3]
-            self[log[0]].remove(tuple(log))
-        if log[4]:
-            log[0], log[4] = log[4], log[0]
-            log[3] = -log[3]
-            self[log[0]].balance -= log[3]
-            self[log[0]].remove(tuple(log))
+    def run(self):
+        while True:
+            try:
+                sells = json.loads(requests.get('https://localbitcoins.com/sell-bitcoins-online/cny/.json').text)
+                price = float(sells['data']['ad_list'][0]['data']['temp_price'])
+                if self.price != price:
+                    self.price_sender.emit(price)
+                    self.price = price
+            except Exception:
+                pass
+            time.sleep(60)
 
 
 class MainWin(QWidget):
-    btype = {'我有的': 0, '要还的': 1, '欠我的': 2}
-
     def __init__(self, parent=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
-        self.setWindowTitle('记账薄')
+        self.setWindowTitle('羊家记账薄')
         self.setMinimumWidth(1280)
-        self.accounts = Account()
-        self.accounts_category = {}
-        self.load_data()
-        mainlayout = QVBoxLayout()
-        toplayout = QHBoxLayout()
-        savebtn = QPushButton('保存')
-        savebtn.setFixedWidth(50)
-        savebtn.clicked.connect(self.save_data)
-        toplayout.addWidget(savebtn)
-        self.displaybar = QLabel()
-        toplayout.addWidget(self.displaybar, alignment=Qt.AlignCenter)
-        mainlayout.addLayout(toplayout)
+        self.myAccountsItems = {}
+        self.bitcoin = Bitcoin()
+        self.bitcoin.price_sender.connect(self.refresh_all)
+        self.bitcoin.start()
+        self.logs = self.load_data()
+
+        mainLayout = QVBoxLayout()
+        topLayout = QHBoxLayout()
+        saveBTN = QPushButton('保存')
+        saveBTN.setFixedWidth(50)
+        saveBTN.clicked.connect(self.save_data)
+        topLayout.addWidget(saveBTN)
+        self.displayBar = QLabel()
+        topLayout.addWidget(self.displayBar, alignment=Qt.AlignCenter)
+        mainLayout.addLayout(topLayout)
 
         downlayout = QHBoxLayout()
-        self.leftsidetree = QTreeWidget()
-        self.leftsidetree.setColumnCount(2)
-        self.leftsidetree.setHeaderHidden(True)
-        self.leftsidetree.setMaximumWidth(300)
-        self.leftsidetree.itemClicked.connect(self.treeitemclicked)
-        self.rightsidetable = QTableWidget()
-        self.rightsidetable.setMinimumWidth(500)
-        self.rightsidetable.setSelectionBehavior(QTableWidget.SelectRows)
-        self.rightsidetable.setSelectionMode(QTableWidget.SingleSelection)
-        self.rightsidetable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        downlayout.addWidget(self.leftsidetree, alignment=Qt.AlignJustify)
-        downlayout.addWidget(self.rightsidetable)
+        self.leftTree = QTreeWidget()
+        self.leftTree.setColumnCount(3)
+        self.leftTree.setHeaderHidden(True)
+        self.leftTree.setEditTriggers(QTreeWidget.NoEditTriggers)
+        self.leftTree.setMaximumWidth(450)
+        self.leftTree.itemClicked.connect(self.tree_item_clicked)
+        self.init_tree()
+
+        self.rightTable = QTableWidget()
+        self.rightTable.setMinimumWidth(500)
+        self.rightTable.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rightTable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.rightTable.setSelectionMode(QTableWidget.SingleSelection)
+        self.rightTable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        downlayout.addWidget(self.leftTree, alignment=Qt.AlignJustify)
+        downlayout.addWidget(self.rightTable)
 
         bottonlayout = QHBoxLayout()
+
         self.balnameline = QLineEdit()
         self.balnameline.setFixedWidth(80)
         self.baltypebox = QComboBox()
         self.baltypebox.setFixedWidth(65)
-        self.baltypebox.addItems(('我有的', '要还的', '欠我的'))
+        self.baltypebox.addItems(SUBLEVEL)
         self.addbalbtn = QPushButton('添加')
         self.addbalbtn.setFixedWidth(40)
-        self.addbalbtn.clicked.connect(self.addbalacc)
+        self.addbalbtn.clicked.connect(self.add_accounts)
         self.delbalbtn = QPushButton('删除')
         self.delbalbtn.setFixedWidth(40)
-        self.delbalbtn.clicked.connect(self.delbalacc)
-
+        self.delbalbtn.clicked.connect(self.del_accounts)
         bottonlayout.addWidget(self.balnameline)
         bottonlayout.addWidget(self.baltypebox)
         bottonlayout.addWidget(self.addbalbtn)
@@ -106,205 +99,255 @@ class MainWin(QWidget):
         self.record_date_line = QLineEdit()
         self.record_date_line.setFixedWidth(70)
         self.source_account_box = QComboBox()
-        self.source_account_box.addItems(sorted(self.accounts.keys()))
         self.record_type_box = QComboBox()
-        self.record_type_box.addItems(('支出', '收入', '转账', '借出', '收回', '借入', '返还'))
+        self.record_type_box.addItems(log_types)
         self.record_type_box.currentIndexChanged.connect(self.record_type_changed)
         self.destination_account_box = QComboBox()
         self.destination_account_box.setVisible(False)
-        self.destination_account_box.addItems(sorted(self.accounts.keys()))
+        self.rebox()
         self.amount_line = QLineEdit()
         self.amount_line.setFixedWidth(100)
         self.desc_line = QLineEdit()
         self.confirmbtn = QPushButton('确认')
         self.confirmbtn.setFixedWidth(40)
-        self.confirmbtn.clicked.connect(self.record_confirmed)
+        self.confirmbtn.clicked.connect(self.log_append)
         self.dellogbtn = QPushButton('删除')
         self.dellogbtn.setFixedWidth(40)
-        self.dellogbtn.clicked.connect(self.dellog_confirmed)
+        self.dellogbtn.clicked.connect(self.log_removal)
         bottonlayout.addWidget(QLabel('日期'))
         bottonlayout.addWidget(self.record_date_line)
         bottonlayout.addWidget(self.source_account_box)
         bottonlayout.addWidget(self.record_type_box)
         bottonlayout.addWidget(QLabel('金额'))
         bottonlayout.addWidget(self.amount_line)
-        bottonlayout.addWidget(QLabel('描述'))
+        bottonlayout.addWidget(QLabel('附言'))
         bottonlayout.addWidget(self.desc_line)
         bottonlayout.addWidget(self.destination_account_box)
         bottonlayout.addWidget(self.confirmbtn)
         bottonlayout.addWidget(self.dellogbtn)
 
-        mainlayout.addLayout(downlayout)
-        mainlayout.addLayout(bottonlayout)
-        self.setLayout(mainlayout)
-        self.display_tree()
-        self.display_table('我的账户')
+        mainLayout.addLayout(downlayout)
+        mainLayout.addLayout(bottonlayout)
+        self.setLayout(mainLayout)
+        self.refresh_all()
+        self.btc_timer = self.startTimer(1000 * 30)
+
+    def init_tree(self):
+        self.myAccountsItems.clear()
+        self.leftTree.clear()
+        topAcc = QTreeWidgetItem()
+        topAcc.setText(0, TOPLEVEL)
+        self.leftTree.addTopLevelItem(topAcc)
+        self.myAccountsItems[TOPLEVEL] = topAcc
+
+    def timerEvent(self, QTimerEvent):
+        if QTimerEvent.timerId() == self.btc_timer:
+            self.refresh_all()
 
     def save_data(self):
-        smb_connection = SMBConnection('', '', '', 'ws832', use_ntlm_v2=True)
-        smb_connection.connect('192.168.0.1', 445)
-        with tempfile.TemporaryFile() as f:
-            f.write(pickle.dumps(self.accounts))
-            f.seek(0)
-            smb_connection.storeFile('WS832', 'Norelsys-2537BCDE_usb1_1/MyAccounts/MyAccounts.dat', f)
+        self.logs.to_csv(PATH + FileName, index=False)
 
-    def load_data(self):
-        smb_connection = SMBConnection('', '', '', 'ws832', use_ntlm_v2=True)
-        smb_connection.connect('192.168.0.1', 445)
-        with tempfile.TemporaryFile() as f:
-            smb_connection.retrieveFile('WS832', 'Norelsys-2537BCDE_usb1_1/MyAccounts/MyAccounts.dat', f)
-            f.seek(0)
-            self.accounts = pickle.loads(f.read())
+    @staticmethod
+    def load_data():
+        ret = pd.read_csv(PATH + FileName, converters={'日期': pd.to_datetime})
+        return ret.sort_values('日期')
 
-    def display_tree(self):
-        self.leftsidetree.clear()
-        accoutitem = QTreeWidgetItem()
-        accoutitem.setText(0, self.accounts.acc_name)
-        self.leftsidetree.addTopLevelItem(accoutitem)
-        for i, each in enumerate(('我有的', '要还的', '欠我的')):
-            treeitem = QTreeWidgetItem()
-            treeitem.setText(0, each)
-            accoutitem.addChild(treeitem)
-            self.accounts_category[i] = treeitem
-        for each in self.accounts:
-            titem = QTreeWidgetItem()
-            titem.setText(0, each)
-            titem.setText(1, str(self.accounts[each].balance))
-            titem.setTextAlignment(1, Qt.AlignCenter)
-            self.accounts_category[self.accounts[each].bal_type].addChild(titem)
-        self.leftsidetree.expandAll()
-        self.leftsidetree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        treeitem = self.leftsidetree.currentItem()
-        if treeitem:
-            self.display_table(treeitem.text(0))
+    def bitcoin_handler(self, price):
+        bitcoinRows = self.logs[self.logs['发起账户'] == BitCoinAccountName]
+        bitcoins = pd.to_numeric(bitcoinRows['附言']).sum()
+        total = bitcoins * price
+        invests = bitcoinRows[bitcoinRows['类型'] != '盈利']['金额'].sum()
+        rewards = total - invests if total else 0
+        self.logs = self.logs.drop(self.logs[(self.logs['发起账户'] == BitCoinAccountName) & (self.logs['类型'] == '盈利')].index)
+        self.logs = self.logs.append(pd.Series({'日期': pd.datetime.now(),
+                                                '发起账户': BitCoinAccountName,
+                                                '类型': '盈利',
+                                                '金额': round(rewards, 2),
+                                                '目标账户': np.nan,
+                                                '附言': np.nan,
+                                                '账户类型': SUBLEVEL[0]}), ignore_index=True)
+
+    def refresh_all(self, bitcoin_price=0):
+        if bitcoin_price:
+            self.bitcoin_handler(bitcoin_price)
+
+        self.myAccountsItems[TOPLEVEL].setText(1, '{:.2f}'.format(self.logs['金额'].sum()))
+        for each in self.logs.groupby('账户类型'):
+            if each[0] in self.myAccountsItems.keys():
+                self.myAccountsItems[each[0]].setText(1, '{:.2f}'.format(each[1]['金额'].sum()))
+            else:
+                treeitem = QTreeWidgetItem()
+                treeitem.setText(0, each[0])
+                treeitem.setText(1, '{:.2f}'.format(each[1]['金额'].sum()))
+                self.myAccountsItems[TOPLEVEL].addChild(treeitem)
+                self.myAccountsItems[each[0]] = treeitem
+        for each in self.logs.groupby('发起账户'):
+            if each[0] in self.myAccountsItems.keys():
+                self.myAccountsItems[each[0]].setText(1, '{:.2f}'.format(each[1]['金额'].sum()))
+            else:
+                titem = QTreeWidgetItem()
+                titem.setText(0, each[0])
+                titem.setText(1, '{:.2f}'.format(self.logs[self.logs['发起账户'] == each[0]]['金额'].sum()))
+                titem.setTextAlignment(1, Qt.AlignCenter)
+                self.myAccountsItems[each[1].iloc[0, -1]].addChild(titem)
+                self.myAccountsItems[each[0]] = titem
+        self.leftTree.expandAll()
+        self.leftTree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        current_table_text = self.leftTree.currentItem().text(0) if self.leftTree.currentItem() else TOPLEVEL
+        self.display_table(current_table_text)
+
+    def display_table(self, _name):
+        self.rightTable.clear()
+        self.rightTable.setColumnCount(len(self.logs.columns[:-1]))
+        self.rightTable.setHorizontalHeaderLabels(list(self.logs.columns)[:-1])
+
+        def place_item(itemlist):
+            self.rightTable.setRowCount(len(itemlist))
+            for r_idx, row in enumerate(itemlist.index):
+                for c_idx, text in enumerate(itemlist.loc[row]):
+                    if str(text) in ('None', 'nan'):
+                        continue
+                    elif isinstance(text, pd.datetime):
+                        titem = QTableWidgetItem(text.strftime('%Y-%m-%d'))
+                        titem.setTextAlignment(Qt.AlignCenter)
+                        titem.setData(1000, text.timestamp())
+                    else:
+                        titem = QTableWidgetItem(str(text))
+                        titem.setTextAlignment(Qt.AlignCenter)
+                    self.rightTable.setItem(r_idx, c_idx, titem)
+
+        if _name == TOPLEVEL:
+            place_item(self.logs)
+        elif _name in ('我有的', '要还的', '欠我的'):
+            place_item(self.logs[self.logs['账户类型'] == _name])
         else:
-            self.display_table(self.accounts.acc_name)
+            place_item(self.logs[self.logs['发起账户'] == _name])
 
-    def addbalacc(self):
+    def tree_item_clicked(self, item):
+        _name = item.text(0)
+        self.display_table(_name)
+        if _name == '比特币':
+            self.displayBar.setText(self.bitcoin_display())
+        else:
+            self.displayBar.setText(self.account_display(_name))
+
+    def bitcoin_display(self):
+        ret = '[{}]\t 持有: {} 个\t总成本: {} 元\t单价: {:.2f} 元\t盈亏: {:.2f} 元\t市值: {:.2f} \t收购价: {:.2f} 元'
+        bit_acc = self.logs[self.logs['发起账户'] == '比特币']
+        total_coins = pd.to_numeric(bit_acc['附言'], errors='coerce').sum()
+        total_invested = bit_acc[bit_acc['类型'] == '转入']['金额'].sum()
+        profit = bit_acc[bit_acc['类型'] == '盈利']['金额'].sum()
+        return ret.format(BitCoinAccountName, total_coins, total_invested, total_invested / total_coins, profit,
+                          total_invested + profit, (total_invested + profit) / total_coins)
+
+    def account_display(self, acc_name):
+        ret = '[{}]\t 净流入 {} 元\t净流出 {} 元'
+        if TOPLEVEL in acc_name:
+            acc = self.logs
+        else:
+            types = '发起账户' if acc_name not in ('我有的', '要还的', '欠我的') else '账户类型'
+            acc = self.logs[(self.logs[types] == acc_name)]
+        income = acc[(acc['金额'] > 0)]['金额'].sum()
+        outcome = acc[(acc['金额'] < 0)]['金额'].sum()
+        return ret.format(acc_name, income, outcome)
+
+    def add_accounts(self):
         bname = self.balnameline.text()
         if not bname:
             return
-        self.accounts.add_balcance(bname, self.btype[self.baltypebox.currentText()])
-        self.save_data()
-        self.display_tree()
-        self.source_account_box.clear()
-        self.source_account_box.addItems(sorted(self.accounts.keys()))
-        self.destination_account_box.clear()
-        self.destination_account_box.addItems(sorted(self.accounts.keys()))
+        self.logs = self.logs.append(pd.Series([pd.datetime.now(), bname, '新建', 0, np.nan, np.nan, self.baltypebox.currentText()],
+                                               index=self.logs.columns,
+                                               name=self.logs.index[-1] + 1))
+        self.rebox()
+        self.refresh_all()
 
-    def delbalacc(self):
-        item = self.leftsidetree.currentItem()
-        if item.text(0) in ('我的账户', '我有的', '要还的', '欠我的'):
+    def del_accounts(self):
+        bname = self.balnameline.text()
+        if not bname:
             return
-        confirm = QMessageBox().warning(self, '确认删除', '确定要删除账户[{}]吗?'.format(item.text(0)),
-                                        QMessageBox.Yes|QMessageBox.No)
+        if bname in [TOPLEVEL] + SUBLEVEL:
+            return
+        confirm = QMessageBox().warning(self, '确认删除', '正在删除[{}]所有记录'.format(bname),
+                                        QMessageBox.Yes | QMessageBox.No)
         if confirm == QMessageBox.No:
             return
-        del self.accounts[item.text(0)]
-        self.save_data()
-        self.display_tree()
-        self.source_account_box.clear()
-        self.source_account_box.addItems(sorted(self.accounts.keys()))
-        self.destination_account_box.clear()
-        self.destination_account_box.addItems(sorted(self.accounts.keys()))
-
-    def treeitemclicked(self, item):
-        _name = item.text(0)
-        self.display_table(_name)
-        if _name not in self.accounts:
-            return
-        self.balnameline.setText(_name)
-
-    def display_table(self, _name=None):
-        if not _name:
-            _name = self.accounts.acc_name
-        total = 0
-        current = 0
-        debt = 0
-        getback = 0
-        for each in self.accounts:
-            total += self.accounts[each].balance
-            if self.accounts[each].bal_type == 0:
-                current += self.accounts[each].balance
-            elif self.accounts[each].bal_type == 1:
-                debt += self.accounts[each].balance
-            elif self.accounts[each].bal_type == 2:
-                getback += self.accounts[each].balance
-
-        self.displaybar.setText('总资产: {}    现有资产: {}    负债: {}    待收: {}'
-                                .format(total, current, debt, getback))
-        self.rightsidetable.clear()
-        self.rightsidetable.setColumnCount(6)
-        self.rightsidetable.setHorizontalHeaderLabels(('发生账户', '日期', '类型', '金额', '关联账户', '描述'))
-        def place_item(itemlist):
-            _items = sorted(itemlist, key=lambda x:x[1])
-            self.rightsidetable.setRowCount(len(_items))
-            for i, each in enumerate(_items):
-                for n in range(len(each)):
-                    if each[n]:
-                        titem = QTableWidgetItem(str(each[n]))
-                        titem.setTextAlignment(Qt.AlignCenter)
-                        self.rightsidetable.setItem(i, n, titem)
-
-        if _name == '我的账户':
-            _takeall = []
-            for each in self.accounts:
-                _takeall.extend(self.accounts[each])
-            place_item(_takeall)
-        elif _name in ('我有的', '要还的', '欠我的'):
-            _takesome = []
-            for each in self.accounts:
-                if self.accounts[each].bal_type == self.btype[_name]:
-                    _takesome.extend(self.accounts[each])
-            place_item(_takesome)
-        else:
-            _takesingle = sorted(self.accounts[_name])
-            place_item(_takesingle)
+        self.logs = self.logs[self.logs['发起账户'] != bname]
+        self.rebox()
+        self.init_tree()
+        self.refresh_all()
 
     def record_type_changed(self, index):
-        if index > 1:
+        if index > 2:
             self.destination_account_box.setVisible(True)
         else:
             self.destination_account_box.setVisible(False)
 
-    def record_confirmed(self):
-        date = self.check_date(self.record_date_line.text())
-        if not date:
-            return
-        amount = self.amount_line.text()
+    def log_append(self):
         try:
-            amount = float(amount)
-        except ValueError:
+            date = self.check_date(self.record_date_line.text())
+        except AttributeError:
+            QMessageBox().critical(self, '错误信息', '日期格式不正确', QMessageBox.Ok)
             return
         s_name = self.source_account_box.currentText()
-        if self.record_type_box.currentIndex() <= 1:
-            self.accounts.operate('-'.join(date), s_name, self.record_type_box.currentText(), amount,
-                                          _descrip=self.desc_line.text())
-        if self.record_type_box.currentIndex() > 1:
-            d_name = self.destination_account_box.currentText()
-            self.accounts.operate('-'.join(date), s_name, self.record_type_box.currentText(), amount, d_name,
-                                          _descrip=self.desc_line.text())
-        self.display_tree()
-        self.display_table(self.accounts.acc_name)
+        r_type = self.record_type_box.currentText()
+        try:
+            amount = float(self.amount_line.text())
+            if r_type in ['支出', '转出', '贷款', '还款', '借出']:
+                amount = -amount
+            if r_type == '调整':
+                amount = amount - self.logs[self.logs['发起账户'] == s_name]['金额'].sum()
+        except ValueError:
+            QMessageBox().critical(self, '错误信息', '金额不对', QMessageBox.Ok)
+            return
+        t_name = self.destination_account_box.currentText() if self.destination_account_box.isVisible() else np.nan
+        notes = self.desc_line.text()
+        acc_type = self.logs[self.logs['发起账户'] == s_name]['账户类型'].values[0]
+        self.logs = self.logs.append(pd.Series([date, s_name, r_type, amount, t_name, notes, acc_type],
+                                               index=self.logs.columns, name=len(self.logs)+1))
+        if self.destination_account_box.isVisible():
+            acc_type = self.logs[self.logs['发起账户'] == t_name]['账户类型'].values[0]
+            self.logs = self.logs.append(pd.Series([date, t_name, oppo_log_types[r_type], -amount, s_name, notes, acc_type],
+                                                   index=self.logs.columns, name=len(self.logs)+1))
+        self.re_index_logs()
+        self.refresh_all()
 
-    def dellog_confirmed(self):
-        _row = self.rightsidetable.currentRow()
-        _remove_item = []
-        for each in range(6):
-            try:
-                _remove_item.append(self.rightsidetable.item(_row, each).text())
-            except AttributeError:
-                _remove_item.append(None)
-        self.accounts.remove_record(_remove_item)
-        self.display_tree()
+    def re_index_logs(self):
+        self.logs = self.logs.sort_values('日期')
+        self.logs.index = range(len(self.logs))
+
+    def log_removal(self):
+        _row = self.rightTable.currentRow()
+        if _row != -1:
+            ts = self.rightTable.item(_row, 0).data(1000)
+            amount = float(self.rightTable.item(_row, 3).text())
+            linesToDel = self.logs[((self.logs['金额'] == amount) | (self.logs['金额'] == -amount))
+                                   & (self.logs['日期'] == pd.datetime.fromtimestamp(ts))]
+            self.logs.drop(linesToDel.index, inplace=True)
+            self.re_index_logs()
+            self.refresh_all()
+
+    def rebox(self):
+        self.source_account_box.clear()
+        self.destination_account_box.clear()
+        self.source_account_box.addItems([x[0] for x in self.logs.groupby('发起账户')])
+        self.destination_account_box.addItems([x[0] for x in self.logs.groupby('发起账户')])
 
     @staticmethod
     def check_date(date):
+        if not date:
+            return pd.datetime.now()
         try:
-            return re.search(r'(\d{4})-?(\d{2})-?(\d{2})$', date).groups()
-        except AttributeError:
-            return False
-
+            return pd.to_datetime(date)
+        except pd._libs.tslib.OutOfBoundsDatetime:
+            now = pd.datetime.now()
+            year = now.year
+            try:
+                month, day = re.search(r'(\d{2})?-?(\d{2})$', date).groups()
+                if not month:
+                    month = now.month
+                return pd.datetime(year, int(month), int(day))
+            except (AttributeError, TypeError):
+                raise AttributeError('Bad date type.')
 
 app = QApplication([])
 
