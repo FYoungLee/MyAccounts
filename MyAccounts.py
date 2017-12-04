@@ -8,6 +8,7 @@ import os
 import requests
 import json
 import time
+import re
 
 PATH = sys.argv[0][:sys.argv[0].rfind(os.sep) + 1] if os.sep in sys.argv[0] else ''
 LogFile = 'my_logs.csv'
@@ -30,34 +31,53 @@ class Pricer(QThread):
 
     def run(self):
         while True:
-            self.bitcoin()
-            self.funds()
+            new = self.bitcoin()
+            now = pd.datetime.now()
+            if self.prices['fund'] is None or now.hour > 18:
+                self.funds()
             self.stocks()
-            self.price_sender.emit(self.prices)
+            if new:
+                self.price_sender.emit(self.prices)
             time.sleep(60)
 
     def bitcoin(self):
         try:
             page = json.loads(requests.get('https://blockchain.info/ticker', timeout=10).text)
-            self.prices['btc'] = page['CNY']['15m']
+            price = page['CNY']['15m']
+            if self.prices['btc'] != price:
+                self.prices['btc'] = price
+                return True
+            return False
         except Exception as err:
             print(err)
 
     def funds(self):
-        url = 'https://fundmobapi.eastmoney.com/FundMApi/FundRankNewList.ashx?pagesize=10000&deviceid=Wap&plat=Wap&product=EFund&version=2.0.0'
+        url = 'https://fundmobapi.eastmoney.com/FundMApi/FundRankNewList.ashx?'
+        data = {'pagesize': 10000, 'deviceid': 'Wap', 'plat': 'Wap', 'product': 'EFund', 'version': '2.0.0'}
         try:
-            data = json.loads(requests.get(url, timeout=20).text)['Datas']
+            data = json.loads(requests.get(url, params=data, timeout=20).text)['Datas']
             self.prices['fund'] = {x['FCODE']: (x['SHORTNAME'], x['DWJZ']) for x in data}
         except Exception as err:
             print(err)
 
     def stocks(self):
-        for stockID in self.prices['stock']:
-            pass
+        # TODO
+        pass
 
     def append(self, types, code):
         if types in ('fund', 'stock'):
             self.prices[types][code] = 0
+
+
+class MyTableItem(QTableWidgetItem):
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            try:
+                my_value = float(re.search(r'([+|-]?\d+\.\d+|0)', self.text()).group(1))
+                other_value = float(re.search(r'([+|-]?\d+\.\d+|0)', other.text()).group(1))
+                return my_value < other_value
+            except (AttributeError, TypeError):
+                return super(MyTableItem, self).__lt__(other)
 
 
 class MainWin(QWidget):
@@ -82,6 +102,11 @@ class MainWin(QWidget):
         topLayout.addWidget(saveBTN)
         self.displayBar = QLabel()
         topLayout.addWidget(self.displayBar, alignment=Qt.AlignCenter)
+        self.typeFilterBox = QComboBox()
+        self.typeFilterBox.setMaximumWidth(150)
+        self.typeFilterBox.addItems(['全部'] + log_types + list(oppo_log_types.values()))
+        self.typeFilterBox.currentIndexChanged.connect(self.display_table)
+        topLayout.addWidget(self.typeFilterBox)
         mainLayout.addLayout(topLayout)
 
         downlayout = QHBoxLayout()
@@ -98,6 +123,7 @@ class MainWin(QWidget):
         self.rightTable.setSelectionBehavior(QTableWidget.SelectRows)
         self.rightTable.setEditTriggers(QTableWidget.NoEditTriggers)
         self.rightTable.setSelectionMode(QTableWidget.SingleSelection)
+        self.rightTable.setSortingEnabled(True)
         self.rightTable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         downlayout.addWidget(self.leftTree, alignment=Qt.AlignJustify)
         downlayout.addWidget(self.rightTable)
@@ -175,6 +201,11 @@ class MainWin(QWidget):
         self.invests_price_line = QLineEdit()
         self.invests_price_line.setValidator(QRegExpValidator(QRegExp(r'[0-9]+\.?[0-9]+')))
         self.investsLayout.addWidget(self.invests_price_line)
+        self.investsLayout.addWidget(QLabel('费率'))
+        self.invests_fee_line = QLineEdit()
+        self.invests_fee_line.setText('0')
+        self.invests_fee_line.setValidator(QRegExpValidator(QRegExp(r'[0-9]+\.?[0-9]+')))
+        self.investsLayout.addWidget(self.invests_fee_line)
         mainLayout.addLayout(self.investsLayout)
 
         self.setLayout(mainLayout)
@@ -262,77 +293,75 @@ class MainWin(QWidget):
                 self.myAccountsItems[each[0]] = treeitem
         self.leftTree.expandAll()
         self.leftTree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        current_table_text = self.leftTree.currentItem().text(0) if self.leftTree.currentItem() else TOPLEVEL
-        self.display_table(current_table_text)
+        self.display_table()
 
-    def display_table(self, _name):
+    def display_table(self):
         self.rightTable.clear()
+        self.rightTable.setSortingEnabled(False)
+        current_table_text = self.leftTree.currentItem().text(0) if self.leftTree.currentItem() else TOPLEVEL
 
         def place_item(itemlist):
             self.rightTable.setRowCount(len(itemlist))
             for r_idx, row in enumerate(itemlist.index):
                 for c_idx, data in enumerate(itemlist.loc[row]):
-                    if str(data) in ('None', 'nan'):
+                    text = str(data)
+                    titem = QTableWidgetItem(text)
+                    if text in ('None', 'nan'):
                         continue
                     elif isinstance(data, pd.datetime):
-                        titem = QTableWidgetItem(data.strftime('%Y-%m-%d'))
-                        titem.setTextAlignment(Qt.AlignCenter)
+                        titem.setText(data.strftime('%Y-%m-%d'))
                         titem.setData(1000, data.timestamp())
-                    else:
-                        if isinstance(data, (float, int)):
-                            text = '{:.2f}'.format(data) if abs(data) > 100 else '{:.4f}'.format(data)
+                    elif isinstance(data, (float, int)):
+                        if itemlist.loc[row].index[c_idx] in ('收益率',):
+                            text = '{:.2%}'.format(data)
                         else:
-                            text = str(data)
-                        titem = QTableWidgetItem(text)
+                            text = '{:.2f}'.format(data) if abs(data) > 100 else '{:.4f}'.format(data)
+                        titem = MyTableItem(text)
                         titem.setData(1000, data)
-                        titem.setTextAlignment(Qt.AlignCenter)
+                    titem.setTextAlignment(Qt.AlignCenter)
                     self.rightTable.setItem(r_idx, c_idx, titem)
-        if _name in ('我的投资', '比特币', '基金', '股票'):
+
+        if current_table_text in ('我的投资', '比特币', '基金', '股票'):
             self.rightTable.setColumnCount(len(self.invests.columns))
             self.rightTable.setHorizontalHeaderLabels(list(self.invests.columns))
-            if _name != '我的投资':
-                place_item(self.invests[self.invests['类型'] == _name])
-            else:
-                place_item(self.invests)
+            itemsForPlace = self.invests
+            if current_table_text != '我的投资':
+                itemsForPlace = self.invests[self.invests['类型'] == current_table_text]
+            place_item(itemsForPlace)
+            self.displayBar.setText(self.invests_display(current_table_text, itemsForPlace))
         else:
+            if self.typeFilterBox.currentText() == '全部':
+                itemsForPlace = self.logs
+            else:
+                itemsForPlace = self.logs[self.logs['类型'] == self.typeFilterBox.currentText()]
             self.rightTable.setColumnCount(len(self.logs.columns[:-1]))
             self.rightTable.setHorizontalHeaderLabels(list(self.logs.columns)[:-1])
-            if _name == TOPLEVEL:
-                place_item(self.logs)
-            elif _name in SUBLEVEL:
-                place_item(self.logs[self.logs['账户类型'] == _name])
-            else:
-                place_item(self.logs[self.logs['发起账户'] == _name])
+            if current_table_text not in [TOPLEVEL] + SUBLEVEL:
+                itemsForPlace = itemsForPlace[itemsForPlace['发起账户'] == current_table_text]
+            elif current_table_text in SUBLEVEL:
+                itemsForPlace = itemsForPlace[itemsForPlace['账户类型'] == current_table_text]
+            place_item(itemsForPlace)
+            self.displayBar.setText(self.account_display(current_table_text, itemsForPlace))
+        self.rightTable.setSortingEnabled(True)
 
     def tree_item_clicked(self, item):
         _name = item.text(0)
-        self.display_table(_name)
-        if _name in ('我的投资', '比特币', '基金', '股票'):
-            self.displayBar.setText(self.invests_display(_name))
-        else:
-            self.displayBar.setText(self.account_display(_name))
+        self.display_table()
         self.balnameline.setText(_name)
 
-    def invests_display(self, acc_name):
+    @staticmethod
+    def invests_display(kw, frame_items):
         ret = '[{}]\t 成本 {:.2f} 元\t市值 {:.2f} 元\t收益 {:.2f}\t收益率 {:.2%}'
-        if acc_name == '我的投资':
-            this = self.invests
-        else:
-            this = self.invests[self.invests['类型'] == acc_name]
-        invested = this['投入资本'].sum()
-        worthy = this['当前市值'].sum()
-        return ret.format(acc_name, invested, worthy, worthy - invested, (worthy - invested) / invested)
+        invested = frame_items['投入资本'].sum()
+        worthy = frame_items['当前市值'].sum()
+        return ret.format(kw, invested, worthy, worthy - invested, (worthy - invested) / invested)
 
-    def account_display(self, acc_name):
-        ret = '[{}]\t 净流入 {} 元\t净流出 {} 元'
-        if TOPLEVEL in acc_name:
-            acc = self.logs
-        else:
-            types = '发起账户' if acc_name not in ('我有的', '要还的', '欠我的') else '账户类型'
-            acc = self.logs[(self.logs[types] == acc_name)]
-        income = acc[(acc['金额'] > 0)]['金额'].sum()
-        outcome = acc[(acc['金额'] < 0)]['金额'].sum()
-        return ret.format(acc_name, income, outcome)
+    @staticmethod
+    def account_display(kw, frame_items):
+        ret = '[{}]\t 净流入 {:.2f} 元\t净流出 {:.2f} 元'
+        income = frame_items[(frame_items['金额'] > 0)]['金额'].sum()
+        outcome = frame_items[(frame_items['金额'] < 0)]['金额'].sum()
+        return ret.format(kw, income, outcome)
 
     def add_accounts(self):
         bname = self.balnameline.text()
@@ -393,6 +422,7 @@ class MainWin(QWidget):
     def invests_append(self, r_type):
         itypes = self.invests_types_combobox.currentText()
         code = self.invests_codes_line.text()
+        fee = float(self.invests_fee_line.text()) if self.invests_fee_line.text() else 0
         if itypes in ('基金', '股票') and not code:
             return
         source_acc = self.source_account_box.currentText()
@@ -421,9 +451,10 @@ class MainWin(QWidget):
                                                 '类型': r_type,
                                                 '金额': -amount,
                                                 '目标账户': np.nan,
-                                                '附言': '{}|{}|{}'.format(itypes, code, quantity),
+                                                '附言': '{}|{}|{}|{}'.format(itypes, code, quantity, fee),
                                                 '账户类型': acc_type}), ignore_index=True)
         rst = self.invests[(self.invests['类型'] == itypes) & (self.invests['代码'] == code)]
+        amount *= (1 - fee)
         if len(rst):
             remain = rst['持有份额'].iloc[0] + quantity
             if remain < 0:
@@ -457,9 +488,9 @@ class MainWin(QWidget):
                                    & (self.logs['日期'] == pd.datetime.fromtimestamp(ts))]
             self.logs.drop(linesToDel.index, inplace=True)
             if linesToDel['类型'].iloc[0] in ('投资', '赎回'):
-                sub_type, code, quantity = linesToDel['附言'].iloc[0].split('|')
+                sub_type, code, quantity, fee = linesToDel['附言'].iloc[0].split('|')
                 rst = self.invests[(self.invests['类型'] == sub_type) & (self.invests['代码'] == code)]
-                rst['持有份额'] -= float(quantity)
+                rst['持有份额'] -= float(quantity) * (1 - float(fee))
                 rst['投入资本'] += amount
                 rst['持仓成本'] = rst['投入资本'] / rst['持有份额']
                 self.invests.update(rst)
