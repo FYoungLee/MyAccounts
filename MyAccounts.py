@@ -46,28 +46,54 @@ class Pricer(QThread):
             self.stocks()
             self.price_sender.emit(self.prices)
             self.prices = pd.DataFrame([], columns=['名称', '当前价格'])
-            time.sleep(300)
+            time.sleep(5)
 
     def currency(self):
-        # page = json.loads(requests.get('https://blockchain.info/ticker', timeout=10).text)
-        # price = page['CNY']['15m']
         try:
+            page = json.loads(self.page_getter('https://blockchain.info/ticker'))
+            price1 = page['CNY']['15m']
             page = json.loads(self.page_getter('https://localbitcoins.com/sell-bitcoins-online/cny/.json'))
-            price = page['data']['ad_list'][0]['data']['temp_price']
-            self.prices = self.prices.append(pd.Series({'名称': '比特币', '当前价格': price}, name='BTC'))
+            price2 = float(page['data']['ad_list'][0]['data']['temp_price'])
+            price = price1 if price1 > price2 else price2
+            self.prices = self.prices.append(pd.Series({'项目': '货币', '名称': '比特币', '当前价格': price}, name='BTC'))
         except json.decoder.JSONDecodeError:
             self.currency()
 
     def funds(self):
-        url = 'https://fundmobapi.eastmoney.com/FundMApi/FundRankNewList.ashx?'
-        data = {'pagesize': 10000, 'deviceid': 'Wap', 'plat': 'Wap', 'product': 'EFund', 'version': '2.0.0'}
-        data = json.loads(self.page_getter(url, params=data))['Datas']
-        funds = [pd.Series({'名称': x['SHORTNAME'], '当前价格': x['DWJZ']}, name=x['FCODE']) for x in data]
-        self.prices = pd.concat([self.prices, pd.DataFrame(funds)])
+        funds = MainWin.invests[MainWin.invests['项目'] == '基金']
+        if len(funds.index):
+            fcodes = funds.index.tolist()
+            url = 'https://fundmobapi.eastmoney.com/FundMApi/FundRankNewList.ashx?'
+            data = {'pagesize': 10000, 'deviceid': 'Wap', 'plat': 'Wap', 'product': 'EFund', 'version': '2.0.0'}
+            data = json.loads(self.page_getter(url, params=data))['Datas']
+            f_list = [pd.Series({'项目': '基金', '名称': x['SHORTNAME'], '当前价格': x['DWJZ']}, name=x['FCODE']) for x in data]
+            f_df = pd.DataFrame(f_list)
+            self.prices = pd.concat([self.prices, f_df.loc[fcodes]])
 
     def stocks(self):
-        # TODO
-        pass
+        def cook_code(scode):
+            if len(scode) == 5:
+                return 'hk' + scode
+            elif '60' in scode[:2]:
+                return 's_sh' + scode
+            else:
+                return 's_sz' + scode
+
+        def cook_page(page_text):
+            ret = {}
+            _stocks = re.findall('_?s?_\w{2}(\d{5,6})="(.+)";', page_text)
+            for row in _stocks:
+                code, _data = row[0], row[1].split(',')
+                name, price = _data[0], _data[1]
+                ret[code] = pd.Series({'项目': '股票', '名称': name, '当前价格': float(price)})
+            return pd.DataFrame(ret).T
+
+        url = 'http://hq.sinajs.cn/list='
+        stocks = MainWin.invests[MainWin.invests['项目']=='股票']
+        if len(stocks.index):
+            scodes = stocks.index.tolist()
+            url += ','.join([cook_code(x) for x in scodes])
+            self.prices = pd.concat([self.prices, cook_page(self.page_getter(url))])
 
 
 class MyTableItem(QTableWidgetItem):
@@ -82,6 +108,10 @@ class MyTableItem(QTableWidgetItem):
 
 
 class MainWin(QWidget):
+    logs = pd.read_csv(PATH + LogFile, converters={'日期': pd.to_datetime})
+    logs.set_index('日期', inplace=True)
+    invests = pd.read_csv(PATH + InvestsFile, index_col='代码')
+    
     def __init__(self, parent=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.setWindowTitle('羊家记账薄')
@@ -89,9 +119,6 @@ class MainWin(QWidget):
         # this variable is used to hold all tree-items within the left-tree
         # in order to easily modify balances of each items.
         self.myAccountsItems = {}
-        self.logs = pd.read_csv(PATH + LogFile, converters={'日期': pd.to_datetime})
-        self.logs.set_index('日期', inplace=True)
-        self.invests = pd.read_csv(PATH + InvestsFile, index_col='代码')
         self.grouped = {}
         self.prices = None
         self.ThePricer = Pricer()
@@ -205,15 +232,16 @@ class MainWin(QWidget):
         self.rebox()
         self.display_tree()
 
-    def save_data(self):
-        self.logs.to_csv(PATH + LogFile)
-        self.invests.to_csv(PATH + InvestsFile)
+    @staticmethod
+    def save_data():
+        MainWin.logs.to_csv(PATH + LogFile)
+        MainWin.invests.to_csv(PATH + InvestsFile)
 
     def rebox(self):
         self.accounts_name_box.clear()
         self.account_ralative_box.clear()
-        acc1 = sorted(self.logs['账户'].unique().tolist())
-        acc2 = sorted([x for x in self.logs['关联'].unique().tolist() if isinstance(x, str) and x not in acc1])
+        acc1 = sorted(MainWin.logs['账户'].unique().tolist())
+        acc2 = sorted([x for x in MainWin.logs['关联'].unique().tolist() if isinstance(x, str) and x not in acc1])
         acc = acc1 + acc2
         acc.append('新增')
         self.accounts_name_box.addItems(acc)
@@ -238,18 +266,18 @@ class MainWin(QWidget):
             self.new_account_relative_line.setVisible(False)
 
     def price_received(self, frame):
-        self.invests.update(frame)
+        MainWin.invests.update(frame)
         self.calculate_invests()
         self.record_date_line.setDate(QDate(pd.datetime.now().year, pd.datetime.now().month, pd.datetime.now().day))
 
     def calculate_invests(self):
-        self.invests.loc[:, '当前价格'] = pd.to_numeric(self.invests['当前价格'])
-        self.invests.loc[:, '当前市值'] = self.invests['当前价格'] * self.invests['持有份额']
-        self.invests.loc[:, '累计盈亏'] = self.invests['当前市值'] - self.invests['投入资本']
-        self.invests.loc[:, '收益率'] = self.invests['累计盈亏'] / self.invests['投入资本']
-        self.invests.loc[:, '成本权重'] = self.invests['投入资本'] / self.invests['投入资本'].sum()
-        self.invests.loc[:, '摊薄收益率'] = self.invests['成本权重'] * self.invests['收益率']
-        self.invests.drop(self.invests[(self.invests['累计盈亏'] == 0) | (self.invests['持有份额'] == 0)].index, inplace=True)
+        MainWin.invests.drop(MainWin.invests[(MainWin.invests['累计盈亏'] == 0) & (MainWin.invests['持有份额'] == 0)].index, inplace=True)
+        MainWin.invests.loc[:, '当前价格'] = pd.to_numeric(MainWin.invests['当前价格'])
+        MainWin.invests.loc[:, '当前市值'] = MainWin.invests['当前价格'] * MainWin.invests['持有份额']
+        MainWin.invests.loc[:, '累计盈亏'] = MainWin.invests['当前市值'] - MainWin.invests['投入资本']
+        MainWin.invests.loc[:, '收益率'] = MainWin.invests['累计盈亏'] / MainWin.invests['投入资本']
+        MainWin.invests.loc[:, '成本权重'] = MainWin.invests['投入资本'] / MainWin.invests['投入资本'].sum()
+        MainWin.invests.loc[:, '摊薄收益率'] = MainWin.invests['成本权重'] * MainWin.invests['收益率']
         self.display_tree()
 
     @staticmethod
@@ -282,7 +310,7 @@ class MainWin(QWidget):
         return grouped
 
     def display_tree(self):
-        self.grouped = self.group_logs(self.logs)
+        self.grouped = self.group_logs(MainWin.logs)
 
         def total_val():
             belongs = 0
@@ -290,8 +318,8 @@ class MainWin(QWidget):
             for each in self.grouped:
                 belongs += self.grouped[each]['value']
                 holding += self.grouped[each]['value'] if self.grouped[each]['value'] > 0 else 0
-            belongs += self.invests['当前市值'].sum()
-            holding += self.invests['当前市值'].sum()
+            belongs += MainWin.invests['当前市值'].sum()
+            holding += MainWin.invests['当前市值'].sum()
             return belongs, holding
 
         total = total_val()
@@ -329,13 +357,13 @@ class MainWin(QWidget):
         if SUBLEVEL[3] not in self.myAccountsItems:
             item = QTreeWidgetItem()
             item.setText(0, SUBLEVEL[3])
-            item.setText(1, '{:.2f}'.format(self.invests['当前市值'].sum()))
+            item.setText(1, '{:.2f}'.format(MainWin.invests['当前市值'].sum()))
             self.myAccountsItems[SUBLEVEL[3]] = item
             self.myAccountsItems[TOPLEVEL].addChild(item)
         else:
-            self.myAccountsItems[SUBLEVEL[3]].setText(1, '{:.2f}'.format(self.invests['当前市值'].sum()))
+            self.myAccountsItems[SUBLEVEL[3]].setText(1, '{:.2f}'.format(MainWin.invests['当前市值'].sum()))
 
-        for iname, invests in self.invests.groupby('项目'):
+        for iname, invests in MainWin.invests.groupby('项目'):
             if iname not in self.myAccountsItems:
                 item = QTreeWidgetItem()
                 item.setText(0, iname)
@@ -380,12 +408,12 @@ class MainWin(QWidget):
         self.rightTable.clear()
         self.rightTable.setSortingEnabled(False)
         current_table_text = self.leftTree.currentItem().text(0) if self.leftTree.currentItem() else TOPLEVEL
-        self.logs = self.logs.reindex(columns=['账户', '类型', '关联', '金额', '备注'])
-        self.invests = self.invests.reindex(columns=['项目', '名称', '收益率', '成本权重', '摊薄收益率', '累计盈亏',
+        MainWin.logs = MainWin.logs.reindex(columns=['账户', '类型', '关联', '金额', '备注'])
+        MainWin.invests = MainWin.invests.reindex(columns=['项目', '名称', '收益率', '成本权重', '摊薄收益率', '累计盈亏',
                                                      '当前价格', '当前市值', '投入资本', '持仓成本', '持有份额'])
 
         if current_table_text in [TOPLEVEL, SUBLEVEL[0]]:
-            items2Place = self.logs
+            items2Place = MainWin.logs
             self.infoDisplayer.setText(self.account_display(current_table_text, items2Place))
         elif current_table_text in SUBLEVEL[1:-1]:
             items2Place = pd.concat(self.grouped[current_table_text]['subs'].values())
@@ -394,10 +422,10 @@ class MainWin(QWidget):
                 items2Place = items2Place[items2Place['类型'] == self.typeFilterBox.currentText()]
             self.infoDisplayer.setText(self.account_display(current_table_text, items2Place))
         elif current_table_text in SUBLEVEL[-1]:
-            items2Place = self.invests.sort_values('收益率', ascending=False)
+            items2Place = MainWin.invests.sort_values('收益率', ascending=False)
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
         elif current_table_text in INVESTS:
-            items2Place = self.invests[self.invests['项目'] == current_table_text].sort_values('收益率', ascending=False)
+            items2Place = MainWin.invests[MainWin.invests['项目'] == current_table_text].sort_values('收益率', ascending=False)
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
         else:
             if current_table_text in self.grouped[SUBLEVEL[0]]['subs'].keys():
@@ -467,7 +495,7 @@ class MainWin(QWidget):
         money = money - float(self.myAccountsItems[name].text(1)) if ttype in '调整' else money
         nframe = pd.DataFrame([{'日期': date, '账户': name, '类型': ttype, '金额': money, '关联': relative, '备注': notes}])
         nframe.set_index('日期', inplace=True)
-        self.logs = self.logs.append(nframe)
+        MainWin.logs = MainWin.logs.append(nframe)
 
     def invests_adding(self, ltype, code, itype, costs, fee, price, shares):
         shares = costs / price if not shares and price else shares
@@ -476,33 +504,33 @@ class MainWin(QWidget):
         if not shares and not costs:
             raise Exception()
         # see if it has already in investment logs
-        if code in self.invests.index:
+        if code in MainWin.invests.index:
             if ltype in '投资':
                 # counting the shares can final get after fee
                 shares = shares * (1 - fee)
-                self.invests.loc[code, '投入资本'] += costs
-                self.invests.loc[code, '持有份额'] += shares
+                MainWin.invests.loc[code, '投入资本'] += costs
+                MainWin.invests.loc[code, '持有份额'] += shares
                 # it has to be nagetive in order to log.
                 costs = -costs
             elif ltype in '赎回':
-                new_shares = self.invests.loc[code, '持有份额'] - shares
+                new_shares = MainWin.invests.loc[code, '持有份额'] - shares
                 # if the given shares beyond all I have, that means sell all of them.
                 if new_shares < 0:
                     new_shares = 0
-                    shares = self.invests.loc[code, '持有份额']
+                    shares = MainWin.invests.loc[code, '持有份额']
                     costs = price * shares
-                self.invests.loc[code, '持有份额'] = new_shares
-                self.invests.loc[code, '投入资本'] -= costs
+                MainWin.invests.loc[code, '持有份额'] = new_shares
+                MainWin.invests.loc[code, '投入资本'] -= costs
                 # recount how much should get back after fee
                 costs = costs * (1 - fee)
-            invests = self.invests.loc[code, '投入资本']
-            holdings = self.invests.loc[code, '持有份额']
-            self.invests.loc[code, '持仓成本'] = invests / holdings if holdings else 0
+            invests = MainWin.invests.loc[code, '投入资本']
+            holdings = MainWin.invests.loc[code, '持有份额']
+            MainWin.invests.loc[code, '持仓成本'] = invests / holdings if holdings else 0
         elif ltype in '投资':
             nframe = pd.DataFrame([{'代码': code, '项目': itype, '名称': np.nan, '持有份额': shares, '持仓成本': price,
                                     '投入资本': costs, '当前价格': np.nan, '当前市值': np.nan, '累计盈亏': np.nan, '收益率': np.nan}])
             nframe.set_index('代码', inplace=True)
-            self.invests = self.invests.append(nframe)
+            MainWin.invests = MainWin.invests.append(nframe)
             costs = -costs
         else:
             raise Exception()
@@ -521,24 +549,25 @@ class MainWin(QWidget):
             return
         date = self.rightTable.item(item_row, 0).data(1000)
         # catch the items that need to be deleted.
-        items_to_delete = self.logs.loc[date]
-        self.logs.drop(date, inplace=True)
+        items_to_delete = MainWin.logs.loc[date]
+        MainWin.logs.drop(date, inplace=True)
         # this operation is use to adjust the data in investments after the logs changed.
         if items_to_delete['类型'] in ('投资', '赎回'):
             cost = items_to_delete['金额']
             itype, code, shares, fee = items_to_delete['备注'].split('|')
             if items_to_delete['类型'] in '投资':
-                self.invests.loc[code, '持有份额'] -= float(shares)
-                self.invests.loc[code, '投入资本'] += cost
+                MainWin.invests.loc[code, '持有份额'] -= float(shares)
+                MainWin.invests.loc[code, '投入资本'] += cost
             else:
-                self.invests.loc[code, '持有份额'] += float(shares)
-                self.invests.loc[code, '投入资本'] += cost / (1 - float(fee))
-            invests = self.invests.loc[code, '投入资本']
-            holdings = self.invests.loc[code, '持有份额']
-            self.invests.loc[code, '持仓成本'] = invests / holdings if holdings else 0
+                MainWin.invests.loc[code, '持有份额'] += float(shares)
+                MainWin.invests.loc[code, '投入资本'] += cost / (1 - float(fee))
+            invests = MainWin.invests.loc[code, '投入资本']
+            holdings = MainWin.invests.loc[code, '持有份额']
+            MainWin.invests.loc[code, '持仓成本'] = invests / holdings if holdings else 0
             self.calculate_invests()
         self.display_tree()
         self.save_data()
+
 
 app = QApplication([])
 
