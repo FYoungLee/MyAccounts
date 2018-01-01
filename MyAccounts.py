@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from PyQt5.QtWidgets import QWidget, QTreeWidget, QTreeWidgetItem, QTableWidget, QTableWidgetItem, QVBoxLayout, \
-    QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox, QMessageBox, QApplication, QHeaderView, QDateTimeEdit
+    QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox, QApplication, QHeaderView, QDateTimeEdit, QDialog
 from PyQt5.Qt import QThread, pyqtSignal, Qt, QRegExpValidator, QRegExp, QDate, QSize
 import sys
 import os
@@ -29,7 +29,7 @@ class Pricer(QThread):
     prices = pd.DataFrame([], columns=['名称', '当前价格'])
 
     @staticmethod
-    def page_getter(url, params=None,timeout=20):
+    def page_getter(url, params=None, timeout=20):
         while True:
             try:
                 page = requests.get(url, params=params, timeout=timeout)
@@ -46,7 +46,7 @@ class Pricer(QThread):
             self.stocks()
             self.price_sender.emit(self.prices)
             self.prices = pd.DataFrame([], columns=['名称', '当前价格'])
-            time.sleep(5)
+            time.sleep(60 * 5)
 
     def currency(self):
         try:
@@ -89,7 +89,7 @@ class Pricer(QThread):
             return pd.DataFrame(ret).T
 
         url = 'http://hq.sinajs.cn/list='
-        stocks = MainWin.invests[MainWin.invests['项目']=='股票']
+        stocks = MainWin.invests[MainWin.invests['项目'] == '股票']
         if len(stocks.index):
             scodes = stocks.index.tolist()
             url += ','.join([cook_code(x) for x in scodes])
@@ -110,8 +110,9 @@ class MyTableItem(QTableWidgetItem):
 class MainWin(QWidget):
     logs = pd.read_csv(PATH + LogFile, converters={'日期': pd.to_datetime})
     logs.set_index('日期', inplace=True)
+    logs = logs.reindex(columns='账户,类型,金额,关联,备注'.split(','))
     invests = pd.read_csv(PATH + InvestsFile, index_col='代码')
-    
+
     def __init__(self, parent=None, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.setWindowTitle('羊家记账薄')
@@ -119,7 +120,8 @@ class MainWin(QWidget):
         # this variable is used to hold all tree-items within the left-tree
         # in order to easily modify balances of each items.
         self.myAccountsItems = {}
-        self.grouped = {}
+        self.grouped_lv1 = {}
+        self.grouped_lv2 = {}
         self.prices = None
         self.ThePricer = Pricer()
         self.ThePricer.price_sender.connect(self.price_received)
@@ -154,6 +156,7 @@ class MainWin(QWidget):
         self.rightTable.setSelectionMode(QTableWidget.SingleSelection)
         self.rightTable.setSortingEnabled(True)
         self.rightTable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.rightTable.doubleClicked.connect(self.doubleclicked)
         downlayout.addWidget(self.leftTree, alignment=Qt.AlignJustify)
         downlayout.addWidget(self.rightTable)
 
@@ -234,6 +237,8 @@ class MainWin(QWidget):
 
     @staticmethod
     def save_data():
+        os.rename(PATH + LogFile, PATH + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + LogFile)
+        os.rename(PATH + InvestsFile, PATH + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + InvestsFile)
         MainWin.logs.to_csv(PATH + LogFile)
         MainWin.invests.to_csv(PATH + InvestsFile)
 
@@ -271,7 +276,8 @@ class MainWin(QWidget):
         self.record_date_line.setDate(QDate(pd.datetime.now().year, pd.datetime.now().month, pd.datetime.now().day))
 
     def calculate_invests(self):
-        MainWin.invests.drop(MainWin.invests[(MainWin.invests['累计盈亏'] == 0) & (MainWin.invests['持有份额'] == 0)].index, inplace=True)
+        MainWin.invests.drop(MainWin.invests[(MainWin.invests['累计盈亏'] == 0) & (MainWin.invests['持有份额'] == 0)].index,
+                             inplace=True)
         MainWin.invests.loc[:, '当前价格'] = pd.to_numeric(MainWin.invests['当前价格'])
         MainWin.invests.loc[:, '当前市值'] = MainWin.invests['当前价格'] * MainWin.invests['持有份额']
         MainWin.invests.loc[:, '累计盈亏'] = MainWin.invests['当前市值'] - MainWin.invests['投入资本']
@@ -280,98 +286,96 @@ class MainWin(QWidget):
         MainWin.invests.loc[:, '摊薄收益率'] = MainWin.invests['成本权重'] * MainWin.invests['收益率']
         self.display_tree()
 
-    @staticmethod
-    def group_logs(logs):
-        grouped = dict()
-        data = {each[0]: each[1] for each in logs.groupby('账户')}
-        grouped[SUBLEVEL[0]] = {'subs': data, 'value': 0}
-        for each in logs.groupby('关联'):
-            if each[0] in grouped[SUBLEVEL[0]]['subs']:
-                before = grouped[SUBLEVEL[0]]['subs'][each[0]]
+    def group_logs(self):
+        def neg_func(x):
+            try:
+                return -x
+            except TypeError:
+                return x
+
+        self.grouped_lv2[SUBLEVEL[0]] = {each[0]: each[1] for each in MainWin.logs.groupby('账户')}
+        for each in MainWin.logs.groupby('关联'):
+            if each[0] in self.grouped_lv2[SUBLEVEL[0]]:
                 copied = each[1].copy()
                 copied.loc[:, '金额'] = -copied['金额']
-                combined = pd.concat([before, copied])
-                grouped[SUBLEVEL[0]]['subs'][each[0]] = combined
-                grouped[SUBLEVEL[0]]['value'] += data[each[0]]['金额'].sum()
-
-        data = {each[0]: each[1] for each in logs[logs['类型'].str.contains(r'借出|收回')].groupby('关联')}
-        values = 0
-        for each in data:
-            data[each].update(data[each]['金额'].apply(lambda x: -x))
-            values += data[each]['金额'].sum()
-        grouped[SUBLEVEL[1]] = {'subs': data, 'value': values}
-
-        data = {each[0]: each[1] for each in logs[logs['类型'].str.contains(r'借入|还款')].groupby('关联')}
-        values = 0
-        for each in data:
-            data[each].update(data[each]['金额'].apply(lambda x: -x))
-            values += data[each]['金额'].sum()
-        grouped[SUBLEVEL[2]] = {'subs': data, 'value': values}
-        return grouped
+                self.grouped_lv2[SUBLEVEL[0]][each[0]] = pd.concat([self.grouped_lv2[SUBLEVEL[0]][each[0]], copied])
+        self.grouped_lv1[SUBLEVEL[0]] = pd.concat(self.grouped_lv2[SUBLEVEL[0]].values())
+        self.grouped_lv2[SUBLEVEL[1]] = {each[0]: each[1].apply(neg_func) for each in
+                                         MainWin.logs[MainWin.logs['类型'].str.contains(r'借出|收回')].groupby('关联')}
+        self.grouped_lv1[SUBLEVEL[1]] = pd.concat(self.grouped_lv2[SUBLEVEL[1]].values())
+        self.grouped_lv2[SUBLEVEL[2]] = {each[0]: each[1].apply(neg_func) for each in
+                                         MainWin.logs[MainWin.logs['类型'].str.contains(r'借入|还款')].groupby('关联')}
+        self.grouped_lv1[SUBLEVEL[2]] = pd.concat(self.grouped_lv2[SUBLEVEL[2]].values())
 
     def display_tree(self):
-        self.grouped = self.group_logs(MainWin.logs)
+        self.group_logs()
 
-        def total_val():
-            belongs = 0
-            holding = 0
-            for each in self.grouped:
-                belongs += self.grouped[each]['value']
-                holding += self.grouped[each]['value'] if self.grouped[each]['value'] > 0 else 0
-            belongs += MainWin.invests['当前市值'].sum()
-            holding += MainWin.invests['当前市值'].sum()
-            return belongs, holding
-
-        total = total_val()
+        # def total_val():
+        #     belongs = 0
+        #     holding = 0
+        #     for each in self.grouped:
+        #         belongs += self.grouped[each]['value']
+        #         holding += self.grouped[each]['value'] if self.grouped[each]['value'] > 0 else 0
+        #     belongs += MainWin.invests['当前市值'].sum()
+        #     holding += MainWin.invests['当前市值'].sum()
+        #     return belongs, holding
+        #
+        # total = total_val()
+        belongs = self.grouped_lv1[SUBLEVEL[0]]['金额'].sum() + self.grouped_lv1[SUBLEVEL[1]]['金额'].sum() + \
+                  self.grouped_lv1[SUBLEVEL[2]]['金额'].sum() + self.invests['当前市值'].sum()
+        holding = self.grouped_lv1[SUBLEVEL[0]]['金额'].sum() + self.invests['当前市值'].sum()
         if TOPLEVEL not in self.myAccountsItems:
             item = QTreeWidgetItem()
             item.setText(0, TOPLEVEL)
-            item.setText(1, '{:.2f}'.format(total[0]))
-            item.setText(2, '{:.2f}'.format(total[1]))
+            item.setText(1, '{:.2f}'.format(belongs))
+            item.setText(2, '{:.2f}'.format(holding))
             self.myAccountsItems[TOPLEVEL] = item
             self.leftTree.addTopLevelItem(item)
         else:
-            self.myAccountsItems[TOPLEVEL].setText(1, '{:.2f}'.format(total[0]))
-            self.myAccountsItems[TOPLEVEL].setText(2, '{:.2f}'.format(total[1]))
+            self.myAccountsItems[TOPLEVEL].setText(1, '{:.2f}'.format(belongs))
+            self.myAccountsItems[TOPLEVEL].setText(2, '{:.2f}'.format(holding))
 
-        for acc in self.grouped:
+        for acc in self.grouped_lv1:
+            remain = self.grouped_lv1[acc]['金额'].sum()
             if acc not in self.myAccountsItems:
                 item = QTreeWidgetItem()
                 item.setText(0, acc)
-                item.setText(1, '{:.2f}'.format(self.grouped[acc]['value']))
+                item.setText(1, '{:.2f}'.format(remain))
                 self.myAccountsItems[acc] = item
                 self.myAccountsItems[TOPLEVEL].addChild(item)
             else:
-                self.myAccountsItems[acc].setText(1, '{:.2f}'.format(self.grouped[acc]['value']))
-            for sub_acc in self.grouped[acc]['subs']:
+                self.myAccountsItems[acc].setText(1, '{:.2f}'.format(remain))
+            for sub_acc in self.grouped_lv2[acc]:
+                remain = self.grouped_lv2[acc][sub_acc]['金额'].sum()
                 if sub_acc not in self.myAccountsItems:
                     item = QTreeWidgetItem()
                     item.setText(0, sub_acc)
-                    item.setText(1, '{:.2f}'.format(self.grouped[acc]['subs'][sub_acc]['金额'].sum()))
+                    item.setText(1, '{:.2f}'.format(remain))
                     self.myAccountsItems[sub_acc] = item
                     self.myAccountsItems[acc].addChild(item)
                 else:
-                    self.myAccountsItems[sub_acc].setText(1, '{:.2f}'.format(
-                        self.grouped[acc]['subs'][sub_acc]['金额'].sum()))
+                    self.myAccountsItems[sub_acc].setText(1, '{:.2f}'.format(remain))
 
+        remain = MainWin.invests['当前市值'].sum()
         if SUBLEVEL[3] not in self.myAccountsItems:
             item = QTreeWidgetItem()
             item.setText(0, SUBLEVEL[3])
-            item.setText(1, '{:.2f}'.format(MainWin.invests['当前市值'].sum()))
+            item.setText(1, '{:.2f}'.format(remain))
             self.myAccountsItems[SUBLEVEL[3]] = item
             self.myAccountsItems[TOPLEVEL].addChild(item)
         else:
-            self.myAccountsItems[SUBLEVEL[3]].setText(1, '{:.2f}'.format(MainWin.invests['当前市值'].sum()))
+            self.myAccountsItems[SUBLEVEL[3]].setText(1, '{:.2f}'.format(remain))
 
         for iname, invests in MainWin.invests.groupby('项目'):
+            remain = invests['当前市值'].sum()
             if iname not in self.myAccountsItems:
                 item = QTreeWidgetItem()
                 item.setText(0, iname)
-                item.setText(1, '{:.2f}'.format(invests['当前市值'].sum()))
+                item.setText(1, '{:.2f}'.format(remain))
                 self.myAccountsItems[iname] = item
                 self.myAccountsItems[SUBLEVEL[3]].addChild(item)
             else:
-                self.myAccountsItems[iname].setText(1, '{:.2f}'.format(invests['当前市值'].sum()))
+                self.myAccountsItems[iname].setText(1, '{:.2f}'.format(remain))
 
         self.leftTree.expandAll()
         self.leftTree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -408,41 +412,39 @@ class MainWin(QWidget):
         self.rightTable.clear()
         self.rightTable.setSortingEnabled(False)
         current_table_text = self.leftTree.currentItem().text(0) if self.leftTree.currentItem() else TOPLEVEL
-        MainWin.logs = MainWin.logs.reindex(columns=['账户', '类型', '关联', '金额', '备注'])
-        MainWin.invests = MainWin.invests.reindex(columns=['项目', '名称', '收益率', '成本权重', '摊薄收益率', '累计盈亏',
-                                                     '当前价格', '当前市值', '投入资本', '持仓成本', '持有份额'])
+        # MainWin.logs = MainWin.logs.reindex(columns=['账户', '类型', '关联', '金额', '备注'])
+        # MainWin.invests = MainWin.invests.reindex(columns=['项目', '名称', '收益率', '成本权重', '摊薄收益率', '累计盈亏',
+        #                                                    '当前价格', '当前市值', '投入资本', '持仓成本', '持有份额'])
 
-        if current_table_text in [TOPLEVEL, SUBLEVEL[0]]:
+        if current_table_text in TOPLEVEL:
             items2Place = MainWin.logs
             self.infoDisplayer.setText(self.account_display(current_table_text, items2Place))
-        elif current_table_text in SUBLEVEL[1:-1]:
-            items2Place = pd.concat(self.grouped[current_table_text]['subs'].values())
-            items2Place.sort_index(inplace=True)
+        elif current_table_text in SUBLEVEL[:-1]:
+            items2Place = self.grouped_lv1[current_table_text]
             if self.typeFilterBox.currentText() not in '全部':
                 items2Place = items2Place[items2Place['类型'] == self.typeFilterBox.currentText()]
             self.infoDisplayer.setText(self.account_display(current_table_text, items2Place))
         elif current_table_text in SUBLEVEL[-1]:
-            items2Place = MainWin.invests.sort_values('收益率', ascending=False)
+            items2Place = MainWin.invests
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
         elif current_table_text in INVESTS:
-            items2Place = MainWin.invests[MainWin.invests['项目'] == current_table_text].sort_values('收益率', ascending=False)
+            items2Place = MainWin.invests[MainWin.invests['项目'] == current_table_text]
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
         else:
-            if current_table_text in self.grouped[SUBLEVEL[0]]['subs'].keys():
-                items2Place = self.grouped[SUBLEVEL[0]]['subs'][current_table_text]
-            elif current_table_text in self.grouped[SUBLEVEL[1]]['subs'].keys():
-                items2Place = self.grouped[SUBLEVEL[1]]['subs'][current_table_text]
-            elif current_table_text in self.grouped[SUBLEVEL[2]]['subs'].keys():
-                items2Place = self.grouped[SUBLEVEL[2]]['subs'][current_table_text]
+            if current_table_text in self.grouped_lv2[SUBLEVEL[0]].keys():
+                items2Place = self.grouped_lv2[SUBLEVEL[0]][current_table_text]
+            elif current_table_text in self.grouped_lv2[SUBLEVEL[1]].keys():
+                items2Place = self.grouped_lv2[SUBLEVEL[1]][current_table_text]
+            elif current_table_text in self.grouped_lv2[SUBLEVEL[2]].keys():
+                items2Place = self.grouped_lv2[SUBLEVEL[2]][current_table_text]
             else:
                 return
-            items2Place.sort_index(inplace=True)
             if self.typeFilterBox.currentText() not in '全部':
                 items2Place = items2Place[items2Place['类型'] == self.typeFilterBox.currentText()]
             self.infoDisplayer.setText(self.account_display(current_table_text, items2Place))
         place_item()
         self.rightTable.setSortingEnabled(True)
-        if current_table_text in ('投资', ) + INVESTS:
+        if current_table_text in ('投资',) + INVESTS:
             self.rightTable.sortByColumn(3, Qt.DescendingOrder)
         else:
             self.rightTable.sortByColumn(0, Qt.DescendingOrder)
@@ -567,6 +569,51 @@ class MainWin(QWidget):
             self.calculate_invests()
         self.display_tree()
         self.save_data()
+
+    def doubleclicked(self, item):
+        if self.leftTree.currentItem().text(0) in ('投资', '基金', '股票', '货币'):
+            code = self.rightTable.item(item.row(), 0).text()
+            logs = MainWin.logs[MainWin.logs['备注'].notnull()]
+            logs = logs[logs['备注'].str.contains(code)]
+            price = self.rightTable.item(item.row(), 7).text()
+            d = DetailedWin(code, logs, float(price), parent=self)
+            d.show()
+
+
+class DetailedWin(QDialog):
+    def __init__(self, title, logs, price, parent=None):
+        super().__init__(parent=parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(800, 600)
+        mainlo = QHBoxLayout()
+        table = QTableWidget()
+        title = ['日期', '类型', '投入|回收', '份额', '单价成本', '当前价格', '市值', '盈亏']
+        table.setColumnCount(len(title))
+        table.setHorizontalHeaderLabels(title)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setSortingEnabled(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.setRowCount(len(logs))
+        for _r, idx in enumerate(logs.index):
+            row = logs.loc[idx]
+            invests = -row['金额']
+            _, _, quan, fee = row['备注'].split('|')
+            each_cost = (invests * (1 - float(fee))) / float(quan)
+            worthy_now = float(quan) * float(price)
+            earned = worthy_now - invests
+            table.setItem(_r, 0, QTableWidgetItem(idx.strftime('%Y-%m-%d')))
+            table.setItem(_r, 1, QTableWidgetItem(row['类型']))
+            table.setItem(_r, 2, QTableWidgetItem('{:.2f}'.format(invests)))
+            table.setItem(_r, 3, QTableWidgetItem(quan))
+            table.setItem(_r, 4, QTableWidgetItem('{:.2f}'.format(each_cost)))
+            table.setItem(_r, 5, QTableWidgetItem('{:.2f}'.format(price)))
+            table.setItem(_r, 6, QTableWidgetItem('{:.2f}'.format(worthy_now)))
+            table.setItem(_r, 7, QTableWidgetItem('{:.2f}'.format(earned)))
+        table.sortByColumn(0, Qt.DescendingOrder)
+        mainlo.addWidget(table)
+        self.setLayout(mainlo)
 
 
 app = QApplication([])
