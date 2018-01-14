@@ -50,12 +50,18 @@ class Pricer(QThread):
 
     def currency(self):
         try:
-            page = json.loads(self.page_getter('https://blockchain.info/ticker'))
-            price1 = page['CNY']['15m']
-            page = json.loads(self.page_getter('https://localbitcoins.com/sell-bitcoins-online/cny/.json'))
-            price2 = float(page['data']['ad_list'][0]['data']['temp_price'])
-            price = price1 if price1 > price2 else price2
-            self.prices = self.prices.append(pd.Series({'项目': '货币', '名称': '比特币', '当前价格': price}, name='BTC'))
+            # page = json.loads(self.page_getter('https://blockchain.info/ticker'))
+            # price1 = page['CNY']['15m']
+            page = json.loads(self.page_getter('https://localbitcoins.com/buy-bitcoins-online/cny/.json'))
+            price = float(page['data']['ad_list'][0]['data']['temp_price'])
+            self.prices = self.prices.append(pd.Series({'项目': '货币', '名称': 'BTC', '当前价格': price}, name='BTC'))
+            cryptos = MainWin.invests[MainWin.invests['项目'] == '货币'].index.tolist()
+            cryptos.remove('BTC')
+            url = 'https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms={}'.format(','.join(cryptos))
+            page = json.loads(self.page_getter(url))
+            for each in page.keys():
+                self.prices = self.prices.append(pd.Series({'项目': '货币', '名称': each,
+                                                            '当前价格': price / page[each]}, name=each))
         except json.decoder.JSONDecodeError:
             self.currency()
 
@@ -110,7 +116,6 @@ class MyTableItem(QTableWidgetItem):
 class MainWin(QWidget):
     logs = pd.read_csv(PATH + LogFile, converters={'日期': pd.to_datetime})
     logs.set_index('日期', inplace=True)
-    logs = logs.reindex(columns='账户,类型,金额,关联,备注'.split(','))
     invests = pd.read_csv(PATH + InvestsFile, index_col='代码')
 
     def __init__(self, parent=None, *args, **kwargs):
@@ -231,14 +236,39 @@ class MainWin(QWidget):
         investsLayout.addWidget(self.invests_fee_line)
         mainLayout.addLayout(investsLayout)
 
+        investConvertLayout = QHBoxLayout()
+        investConvertLayout.addStretch(100)
+        self.convert_ok_button = QPushButton('投资转换')
+        self.convert_ok_button.clicked.connect(self.convert_investments)
+        investConvertLayout.addWidget(self.convert_ok_button)
+        investConvertLayout.addWidget(QLabel('从代码：'))
+        self.convert_left_code_line = QLineEdit()
+        investConvertLayout.addWidget(self.convert_left_code_line)
+        investConvertLayout.addWidget(QLabel('量：'))
+        self.convert_left_amount_line = QLineEdit()
+        investConvertLayout.addWidget(self.convert_left_amount_line)
+        investConvertLayout.addWidget(QLabel('到代码：'))
+        self.convert_right_code_line = QLineEdit()
+        investConvertLayout.addWidget(self.convert_right_code_line)
+        investConvertLayout.addWidget(QLabel('量：'))
+        self.convert_right_amount_line = QLineEdit()
+        investConvertLayout.addWidget(self.convert_right_amount_line)
+        mainLayout.addLayout(investConvertLayout)
+
         self.setLayout(mainLayout)
         self.rebox()
         self.display_tree()
 
     @staticmethod
     def save_data():
-        os.rename(PATH + LogFile, PATH + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + LogFile)
-        os.rename(PATH + InvestsFile, PATH + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + InvestsFile)
+        try:
+            os.mkdir(PATH + 'backup')
+        except:
+            pass
+        old_logs = PATH + 'backup/' + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + LogFile
+        old_invests = PATH + 'backup/' + pd.datetime.now().strftime('%Y%m%d%H%M%S') + '_bak_' + InvestsFile
+        MainWin.logs.to_csv(old_logs)
+        MainWin.invests.to_csv(old_invests)
         MainWin.logs.to_csv(PATH + LogFile)
         MainWin.invests.to_csv(PATH + InvestsFile)
 
@@ -308,6 +338,9 @@ class MainWin(QWidget):
         self.grouped_lv1[SUBLEVEL[2]] = pd.concat(self.grouped_lv2[SUBLEVEL[2]].values())
 
     def display_tree(self):
+        MainWin.logs = MainWin.logs.reindex(columns='账户,类型,金额,关联,备注'.split(','))
+        MainWin.invests = MainWin.invests.reindex(columns='项目,名称,收益率,累计盈亏,当前价格,持仓成本,'
+                                                          '当前市值,投入资本,持有份额,成本权重,摊薄收益率'.split(','))
         self.group_logs()
 
         # def total_val():
@@ -403,7 +436,7 @@ class MainWin(QWidget):
                         if items2Place.loc[row].index[c_idx] in ('收益率', '成本权重', '摊薄收益率'):
                             text = '{:.2%}'.format(data)
                         else:
-                            text = '{:.2f}'.format(data) if abs(data) > 100 else '{:.4f}'.format(data)
+                            text = string_float(data)
                         titem = MyTableItem(text)
                         titem.setData(1000, data)
                     titem.setTextAlignment(Qt.AlignCenter)
@@ -575,19 +608,37 @@ class MainWin(QWidget):
             code = self.rightTable.item(item.row(), 0).text()
             logs = MainWin.logs[MainWin.logs['备注'].notnull()]
             logs = logs[logs['备注'].str.contains(code)]
-            price = self.rightTable.item(item.row(), 7).text()
-            d = DetailedWin(code, logs, float(price), parent=self)
+            if not len(logs):
+                return
+            price = self.rightTable.item(item.row(), 5).text()
+            d = DetailedWin('{} {}'.format(code, self.rightTable.item(item.row(), 2).text()),
+                            logs, float(price), parent=self)
             d.show()
+
+    def convert_investments(self):
+        try:
+            itype = self.invests_types_combobox.currentText()
+            l_code = self.convert_left_code_line.text()
+            l_amount = float(self.convert_left_amount_line.text())
+            r_code = self.convert_right_code_line.text()
+            r_amount = float(self.convert_right_amount_line.text())
+            total_getback = l_amount * MainWin.invests.loc[l_code, '当前价格']
+            if l_code and l_amount and r_code and r_amount:
+                self.invests_adding('赎回', l_code, itype, total_getback, 0, 0, l_amount)
+                self.invests_adding('投资', r_code, itype, total_getback, 0, 0, r_amount)
+                self.display_tree()
+        except:
+            return
 
 
 class DetailedWin(QDialog):
     def __init__(self, title, logs, price, parent=None):
         super().__init__(parent=parent)
         self.setWindowTitle(title)
-        self.setMinimumSize(800, 600)
+        self.setMinimumWidth(800)
         mainlo = QHBoxLayout()
         table = QTableWidget()
-        title = ['日期', '类型', '投入|回收', '份额', '单价成本', '当前价格', '市值', '盈亏']
+        title = ['日期', '投入|回收', '份额', '单价成本', '当前价格', '市值', '盈亏', '收益']
         table.setColumnCount(len(title))
         table.setHorizontalHeaderLabels(title)
         table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -595,25 +646,59 @@ class DetailedWin(QDialog):
         table.setSelectionMode(QTableWidget.SingleSelection)
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.setRowCount(len(logs))
-        for _r, idx in enumerate(logs.index):
+        remain = []
+        get_back = {'q': 0, 'm': 0}
+        for idx in logs.index:
             row = logs.loc[idx]
-            invests = -row['金额']
+            money = -row['金额']
             _, _, quan, fee = row['备注'].split('|')
-            each_cost = (invests * (1 - float(fee))) / float(quan)
+            each_cost = (money * (1 - float(fee))) / float(quan)
+            if row['类型'] in '投资':
+                remain.append([idx.strftime('%Y-%m-%d'), money, float(quan), each_cost])
+            else:
+                get_back['q'] += float(quan)
+                get_back['m'] += money
+        try:
+            get_back['avg'] = get_back['m'] / get_back['q']
+        except ZeroDivisionError:
+            get_back['avg'] = 0
+        frame = pd.DataFrame(remain).sort_values(3)
+        for idx in frame.index:
+            if get_back['q'] and get_back['m']:
+                if frame.loc[idx, 2] >= get_back['q']:
+                    frame.loc[idx, 2] -= get_back['q']
+                    frame.loc[idx, 1] -= get_back['m']
+                    break
+                else:
+                    money_sub = frame.loc[idx, 2] * get_back['avg']
+                    get_back['q'] -= frame.loc[idx, 2]
+                    get_back['m'] -= money_sub
+                    frame.loc[idx, 2] = 0
+                    frame.loc[idx, 1] -= money_sub
+        table.setRowCount(len(frame))
+        for _r, idx in enumerate(frame.index):
+            row = frame.loc[idx]
+            invests = row[1]
+            quan = row[2]
+            each_cost = row[3]
             worthy_now = float(quan) * float(price)
             earned = worthy_now - invests
-            table.setItem(_r, 0, QTableWidgetItem(idx.strftime('%Y-%m-%d')))
-            table.setItem(_r, 1, QTableWidgetItem(row['类型']))
-            table.setItem(_r, 2, QTableWidgetItem('{:.2f}'.format(invests)))
-            table.setItem(_r, 3, QTableWidgetItem(quan))
-            table.setItem(_r, 4, QTableWidgetItem('{:.2f}'.format(each_cost)))
-            table.setItem(_r, 5, QTableWidgetItem('{:.2f}'.format(price)))
-            table.setItem(_r, 6, QTableWidgetItem('{:.2f}'.format(worthy_now)))
-            table.setItem(_r, 7, QTableWidgetItem('{:.2f}'.format(earned)))
+            change = earned / invests
+            table.setItem(_r, 0, QTableWidgetItem(row[0]))
+            table.setItem(_r, 1, MyTableItem(string_float(invests)))
+            table.setItem(_r, 2, MyTableItem(string_float(quan)))
+            table.setItem(_r, 3, MyTableItem(string_float(each_cost)))
+            table.setItem(_r, 4, MyTableItem(string_float(price)))
+            table.setItem(_r, 5, MyTableItem(string_float(worthy_now)))
+            table.setItem(_r, 6, MyTableItem(string_float(earned)))
+            table.setItem(_r, 7, MyTableItem('{:.4%}'.format(change)))
         table.sortByColumn(0, Qt.DescendingOrder)
         mainlo.addWidget(table)
         self.setLayout(mainlo)
+
+
+def string_float(values):
+    return '{:.2f}'.format(values) if abs(values) > 100 else '{:.4f}'.format(values)
 
 
 app = QApplication([])
