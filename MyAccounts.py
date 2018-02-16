@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from PyQt5.QtWidgets import QWidget, QTreeWidget, QTreeWidgetItem, QTableWidget, QTableWidgetItem, QVBoxLayout, \
-    QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox, QApplication, QHeaderView, QDateTimeEdit, QDialog
+    QHBoxLayout, QPushButton, QLabel, QLineEdit, QComboBox, QApplication, QHeaderView, QDateTimeEdit, QDialog, QMessageBox
 from PyQt5.Qt import QThread, pyqtSignal, Qt, QRegExpValidator, QRegExp, QDate, QSize
 import sys
 import os
@@ -46,7 +46,7 @@ class Pricer(QThread):
             self.stocks()
             self.price_sender.emit(self.prices)
             self.prices = pd.DataFrame([], columns=['名称', '当前价格'])
-            time.sleep(60 * 5)
+            time.sleep(60)
 
     def currency(self):
         try:
@@ -67,14 +67,15 @@ class Pricer(QThread):
 
     def funds(self):
         funds = MainWin.invests[MainWin.invests['项目'] == '基金']
+        f_list = []
         if len(funds.index):
             fcodes = funds.index.tolist()
-            url = 'https://fundmobapi.eastmoney.com/FundMApi/FundRankNewList.ashx?'
-            data = {'pagesize': 10000, 'deviceid': 'Wap', 'plat': 'Wap', 'product': 'EFund', 'version': '2.0.0'}
-            data = json.loads(self.page_getter(url, params=data))['Datas']
-            f_list = [pd.Series({'项目': '基金', '名称': x['SHORTNAME'], '当前价格': x['DWJZ']}, name=x['FCODE']) for x in data]
-            f_df = pd.DataFrame(f_list)
-            self.prices = pd.concat([self.prices, f_df.loc[fcodes]])
+            url = 'https://fundmobapi.eastmoney.com/FundMApi/FundBaseTypeInformation.ashx?'
+            for each in fcodes:
+                param = {'FCODE': each, 'deviceid': 'Wap', 'plat': 'Wap', 'product': 'EFund', 'version': '2.0.0'}
+                data = json.loads(self.page_getter(url, params=param))['Datas']
+                f_list.append(pd.Series({'项目': '基金', '名称': data['SHORTNAME'], '当前价格': data['DWJZ']}, name=each))
+            self.prices = pd.concat([self.prices, pd.DataFrame(f_list)])
 
     def stocks(self):
         def cook_code(scode):
@@ -238,7 +239,7 @@ class MainWin(QWidget):
 
         investConvertLayout = QHBoxLayout()
         investConvertLayout.addStretch(100)
-        self.convert_ok_button = QPushButton('投资转换')
+        self.convert_ok_button = QPushButton('品种转换')
         self.convert_ok_button.clicked.connect(self.convert_investments)
         investConvertLayout.addWidget(self.convert_ok_button)
         investConvertLayout.addWidget(QLabel('从代码：'))
@@ -247,6 +248,9 @@ class MainWin(QWidget):
         investConvertLayout.addWidget(QLabel('量：'))
         self.convert_left_amount_line = QLineEdit()
         investConvertLayout.addWidget(self.convert_left_amount_line)
+        self.max_convert_button = QPushButton('全部')
+        self.max_convert_button.clicked.connect(self.max_convert)
+        investConvertLayout.addWidget(self.max_convert_button)
         investConvertLayout.addWidget(QLabel('到代码：'))
         self.convert_right_code_line = QLineEdit()
         investConvertLayout.addWidget(self.convert_right_code_line)
@@ -306,8 +310,8 @@ class MainWin(QWidget):
         self.record_date_line.setDate(QDate(pd.datetime.now().year, pd.datetime.now().month, pd.datetime.now().day))
 
     def calculate_invests(self):
-        MainWin.invests.drop(MainWin.invests[(MainWin.invests['累计盈亏'] == 0) & (MainWin.invests['持有份额'] == 0)].index,
-                             inplace=True)
+        # MainWin.invests.drop(MainWin.invests[(MainWin.invests['累计盈亏'] == 0) & (MainWin.invests['持有份额'] == 0)].index,
+        #                      inplace=True)
         MainWin.invests.loc[:, '当前价格'] = pd.to_numeric(MainWin.invests['当前价格'])
         MainWin.invests.loc[:, '当前市值'] = MainWin.invests['当前价格'] * MainWin.invests['持有份额']
         MainWin.invests.loc[:, '累计盈亏'] = MainWin.invests['当前市值'] - MainWin.invests['投入资本']
@@ -424,7 +428,7 @@ class MainWin(QWidget):
                 titem = QTableWidgetItem(text)
                 titem.setTextAlignment(Qt.AlignCenter)
                 if isinstance(row, pd.datetime):
-                    titem.setText(row.strftime('%Y-%m-%d'))
+                    titem.setText(row.strftime('%Y-%m-%d %H:%M:%S'))
                     titem.setData(1000, row)
                 self.rightTable.setItem(r_idx, 0, titem)
                 for c_idx, data in enumerate(items2Place.loc[row]):
@@ -460,9 +464,11 @@ class MainWin(QWidget):
         elif current_table_text in SUBLEVEL[-1]:
             items2Place = MainWin.invests
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
+            items2Place = items2Place[items2Place['投入资本'] > 1]
         elif current_table_text in INVESTS:
             items2Place = MainWin.invests[MainWin.invests['项目'] == current_table_text]
             self.infoDisplayer.setText(self.invests_display(current_table_text, items2Place))
+            items2Place = items2Place[items2Place['投入资本'] > 1]
         else:
             if current_table_text in self.grouped_lv2[SUBLEVEL[0]].keys():
                 items2Place = self.grouped_lv2[SUBLEVEL[0]][current_table_text]
@@ -498,8 +504,9 @@ class MainWin(QWidget):
 
     def ok_pressed(self):
         date = self.record_date_line.date()
-        hour, minute, sec = pd.datetime.now().hour, pd.datetime.now().minute, pd.datetime.now().second
-        date = pd.datetime(date.year(), date.month(), date.day(), hour, minute, sec)
+        hour, minute, sec, ms = pd.datetime.now().hour, pd.datetime.now().minute, \
+                            pd.datetime.now().second, pd.datetime.now().microsecond
+        date = pd.datetime(date.year(), date.month(), date.day(), hour, minute, sec, ms)
         log_name = self.new_account_line.text() \
             if self.accounts_name_box.currentText() in '新增' else self.accounts_name_box.currentText()
         log_type = self.record_type_box.currentText()
@@ -569,7 +576,7 @@ class MainWin(QWidget):
             costs = -costs
         else:
             raise Exception()
-        notes = '{}|{}|{}|{}'.format(itype, code, shares, fee)
+        notes = '{}|{}|{}|{}|{}'.format(itype, code, shares, fee, self.notes_line.text())
         self.calculate_invests()
         return costs, notes
 
@@ -589,7 +596,10 @@ class MainWin(QWidget):
         # this operation is use to adjust the data in investments after the logs changed.
         if items_to_delete['类型'] in ('投资', '赎回'):
             cost = items_to_delete['金额']
-            itype, code, shares, fee = items_to_delete['备注'].split('|')
+            try:
+                itype, code, shares, fee, _ = items_to_delete['备注'].split('|')
+            except:
+                itype, code, shares, fee = items_to_delete['备注'].split('|')
             if items_to_delete['类型'] in '投资':
                 MainWin.invests.loc[code, '持有份额'] -= float(shares)
                 MainWin.invests.loc[code, '投入资本'] += cost
@@ -615,18 +625,53 @@ class MainWin(QWidget):
                             logs, float(price), parent=self)
             d.show()
 
+    def max_convert(self):
+        try:
+            code = self.convert_left_code_line.text()
+            max_holding = MainWin.invests.loc[code, '持有份额']
+            self.convert_left_amount_line.setText(str(max_holding))
+        except:
+            return
+
     def convert_investments(self):
         try:
-            itype = self.invests_types_combobox.currentText()
             l_code = self.convert_left_code_line.text()
             l_amount = float(self.convert_left_amount_line.text())
             r_code = self.convert_right_code_line.text()
             r_amount = float(self.convert_right_amount_line.text())
-            total_getback = l_amount * MainWin.invests.loc[l_code, '当前价格']
+            costs = l_amount * MainWin.invests.loc[l_code, '当前价格']
             if l_code and l_amount and r_code and r_amount:
-                self.invests_adding('赎回', l_code, itype, total_getback, 0, 0, l_amount)
-                self.invests_adding('投资', r_code, itype, total_getback, 0, 0, r_amount)
+                self.accounts_name_box.setCurrentText('支付宝')
+                self.notes_line.setText('{}转换{}'.format(l_code, r_code))
+                self.record_type_box.setCurrentText('赎回')
+                self.costs_line.setText(str(costs))
+                self.invests_codes_line.setText(l_code)
+                self.invests_fee_line.clear()
+                self.invests_price_line.clear()
+                self.invests_shares_line.setText(str(l_amount))
+                self.ok_pressed()
+                self.record_type_box.setCurrentText('投资')
+                self.invests_codes_line.setText(r_code)
+                self.invests_shares_line.setText(str(r_amount))
+                self.ok_pressed()
                 self.display_tree()
+            if MainWin.invests.loc[l_code, '持有份额'] == 0:
+                profit_transfer = QMessageBox().question(self, '份额为0', '已经没有份额了，需要转移成本吗？',
+                                                         QMessageBox.Ok, QMessageBox.Cancel)
+                if profit_transfer == QMessageBox.Ok:
+                    total_inv = MainWin.invests.loc[l_code, '投入资本']
+                    self.accounts_name_box.setCurrentText('支付宝')
+                    self.notes_line.setText('{}成本转换{}'.format(l_code, r_code))
+                    self.record_type_box.setCurrentText('赎回')
+                    self.costs_line.setText(str(total_inv))
+                    self.invests_codes_line.setText(l_code)
+                    self.invests_fee_line.clear()
+                    self.invests_price_line.clear()
+                    self.invests_shares_line.clear()
+                    self.ok_pressed()
+                    self.record_type_box.setCurrentText('投资')
+                    self.invests_codes_line.setText(r_code)
+                    self.ok_pressed()
         except:
             return
 
@@ -651,7 +696,10 @@ class DetailedWin(QDialog):
         for idx in logs.index:
             row = logs.loc[idx]
             money = -row['金额']
-            _, _, quan, fee = row['备注'].split('|')
+            try:
+                _, _, quan, fee, _ = row['备注'].split('|')
+            except:
+                _, _, quan, fee = row['备注'].split('|')
             each_cost = (money * (1 - float(fee))) / float(quan)
             if row['类型'] in '投资':
                 remain.append([idx.strftime('%Y-%m-%d'), money, float(quan), each_cost])
